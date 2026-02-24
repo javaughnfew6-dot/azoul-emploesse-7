@@ -1,0 +1,521 @@
+// server.mjs
+// One-file app: Express API + HTML UI + SQLite storage for Employee Reports
+// Features: list, bulk delete by IDs or filter, soft delete (undo) or hard delete, JSON export.
+// ------------------------------------------------------------
+
+import express from "express";
+import path from "path";
+import { fileURLToPath } from "url";
+import Database from "better-sqlite3";
+
+// ---------- Setup ----------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const app = express();
+app.use(express.json());
+
+// ---------- Database (SQLite) ----------
+const db = new Database(path.join(__dirname, "employee_reports.db"));
+
+// Create table if not exists
+db.exec(`
+CREATE TABLE IF NOT EXISTS reports (
+  id TEXT PRIMARY KEY,
+  email TEXT,
+  issue TEXT,
+  tags TEXT,             -- JSON array of strings
+  created_at TEXT,       -- ISO timestamp
+  deleted_at TEXT        -- ISO timestamp or NULL
+);
+`);
+
+// Seed if empty (demo data similar to your screenshot)
+const count = db.prepare(`SELECT COUNT(*) as c FROM reports`).get().c;
+if (count === 0) {
+  const seed = db.prepare(`
+    INSERT INTO reports (id, email, issue, tags, created_at, deleted_at)
+    VALUES (@id, @email, @issue, @tags, @created_at, NULL)
+  `);
+  const now = new Date();
+  const iso = (d) => new Date(d).toISOString();
+
+  const rows = [
+    { id: cryptoRandomId(), email: "javaughnfewe6@gmail.com", issue: "n/a", tags: ["Burnout"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "javaughnfewe6@gmail.com", issue: "n/a", tags: ["No issue selected"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "javaughnfewe6@gmail.com", issue: "n/a", tags: ["Burnout"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "Unknown", issue: "N/A", tags: ["Culture"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "Unknown", issue: "N/A", tags: ["Safety"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "Unknown", issue: "N/A", tags: ["Culture"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "Unknown", issue: "N/A", tags: ["Management"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "Unknown", issue: "N/A", tags: ["Benefits"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "Unknown", issue: "N/A", tags: ["Overtime"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "Unknown", issue: "N/A", tags: ["Low Pay"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "Unknown", issue: "N/A", tags: ["Career Growth"], created_at: iso(now) },
+    { id: cryptoRandomId(), email: "Unknown", issue: "N/A", tags: ["Other"], created_at: iso(now) },
+  ];
+  const tx = db.transaction((arr) => arr.forEach((r) => seed.run({
+    ...r,
+    tags: JSON.stringify(r.tags),
+  })));
+  tx(rows);
+  console.log(`Seeded ${rows.length} demo reports.`);
+}
+
+// Helper: random IDs that look like UUIDs (not strict UUID)
+function cryptoRandomId() {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+// ---------- Reusable SQL helpers ----------
+const listStmt = db.prepare(`
+  SELECT id, email, issue, tags, created_at, deleted_at
+  FROM reports
+  WHERE (@includeDeleted = 1 OR deleted_at IS NULL)
+  ORDER BY datetime(created_at) DESC
+`);
+
+const selectCountFiltered = (filter) => {
+  const { emailIsUnknown, tagIn, createdAfter, createdBefore, includeDeleted } = normalizeFilter(filter);
+  const where = [];
+  const params = { includeDeleted: includeDeleted ? 1 : 0 };
+
+  if (!includeDeleted) where.push(`deleted_at IS NULL`);
+  if (emailIsUnknown) where.push(`(email IS NULL OR email = '' OR email = 'Unknown')`);
+  if (tagIn?.length) {
+    where.push(`EXISTS (
+      SELECT 1
+      FROM json_each(reports.tags)
+      WHERE json_each.value IN (${tagIn.map((_, i) => `@tag_${i}`).join(", ")})
+    )`);
+    tagIn.forEach((t, i) => (params[`tag_${i}`] = t));
+  }
+  if (createdAfter) {
+    where.push(`datetime(created_at) >= datetime(@createdAfter)`);
+    params.createdAfter = createdAfter;
+  }
+  if (createdBefore) {
+    where.push(`datetime(created_at) <= datetime(@createdBefore)`);
+    params.createdBefore = createdBefore;
+  }
+
+  const sql = `
+    SELECT COUNT(*) as c FROM reports
+    ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+  `;
+  return { sql, params };
+};
+
+const deleteByIdsSoft = db.prepare(`
+  UPDATE reports SET deleted_at = @now
+  WHERE id IN (SELECT value FROM json_each(@idsJson)) AND deleted_at IS NULL
+`);
+
+const deleteByIdsHard = db.prepare(`
+  DELETE FROM reports WHERE id IN (SELECT value FROM json_each(@idsJson))
+`);
+
+function buildDeleteByFilter(filter, soft) {
+  const { emailIsUnknown, tagIn, createdAfter, createdBefore } = normalizeFilter(filter);
+  const where = [];
+  const params = {};
+
+  if (emailIsUnknown) where.push(`(email IS NULL OR email = '' OR email = 'Unknown')`);
+  if (tagIn?.length) {
+    where.push(`EXISTS (
+      SELECT 1 FROM json_each(reports.tags)
+      WHERE json_each.value IN (${tagIn.map((_, i) => `@tag_${i}`).join(", ")})
+    )`);
+    tagIn.forEach((t, i) => (params[`tag_${i}`] = t));
+  }
+  if (createdAfter) {
+    where.push(`datetime(created_at) >= datetime(@createdAfter)`);
+    params.createdAfter = createdAfter;
+  }
+  if (createdBefore) {
+    where.push(`datetime(created_at) <= datetime(@createdBefore)`);
+    params.createdBefore = createdBefore;
+  }
+  // Only act on active rows for soft delete
+  if (soft) where.push(`deleted_at IS NULL`);
+
+  const sql = soft
+    ? `UPDATE reports SET deleted_at = @now ${where.length ? "WHERE " + where.join(" AND ") : ""}`
+    : `DELETE FROM reports ${where.length ? "WHERE " + where.join(" AND ") : ""}`;
+
+  return { sql, params };
+}
+
+function normalizeFilter(f = {}) {
+  return {
+    emailIsUnknown: !!f.emailIsUnknown,
+    tagIn: Array.isArray(f.tagIn) ? f.tagIn.filter(Boolean) : [],
+    createdAfter: f.createdAfter || null,
+    createdBefore: f.createdBefore || null,
+    includeDeleted: !!f.includeDeleted,
+  };
+}
+
+// In-memory store just to support "Undo last delete (soft)"
+let lastSoftDeletedIds = [];
+
+// ---------- API Routes ----------
+
+// List reports
+app.get("/api/reports", (req, res) => {
+  const includeDeleted = req.query.includeDeleted === "true" ? 1 : 0;
+  const rows = listStmt.all({ includeDeleted });
+  const parsed = rows.map(r => ({ ...r, tags: safeParseJson(r.tags, []) }));
+  res.json(parsed);
+});
+
+// Bulk delete by IDs
+app.post("/api/reports/bulk-delete", (req, res) => {
+  try {
+    const { ids, softDelete = true } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: "ids[] required" });
+    }
+    const idsJson = JSON.stringify(ids);
+    let deleted = 0;
+
+    if (softDelete) {
+      const now = new Date().toISOString();
+      const info = deleteByIdsSoft.run({ now, idsJson });
+      deleted = info.changes || 0;
+      // Track ids that just got soft-deleted (only successful ones)
+      const updatedRows = db.prepare(`
+        SELECT id FROM reports
+        WHERE id IN (SELECT value FROM json_each(@idsJson)) AND deleted_at IS NOT NULL
+      `).all({ idsJson });
+      lastSoftDeletedIds = updatedRows.map(r => r.id);
+    } else {
+      const info = deleteByIdsHard.run({ idsJson });
+      deleted = info.changes || 0;
+      lastSoftDeletedIds = []; // hard delete can't be undone here
+    }
+
+    res.json({ deleted });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete by filter
+app.post("/api/reports/delete-by-filter", (req, res) => {
+  try {
+    const { softDelete = true, ...filter } = req.body || {};
+    // Optional "dry run" to show count before deleting
+    const { sql: countSql, params: countParams } = selectCountFiltered({ ...filter, includeDeleted: softDelete ? false : true });
+    const { c: wouldAffect } = db.prepare(countSql).get(countParams);
+
+    const { sql, params } = buildDeleteByFilter(filter, !!softDelete);
+
+    let changed = 0;
+    if (softDelete) {
+      const now = new Date().toISOString();
+      const info = db.prepare(sql).run({ ...params, now });
+      changed = info.changes || 0;
+
+      // Capture exactly what we soft-deleted to enable Undo
+      const wherePreview = sql.replace(/^UPDATE reports SET deleted_at = @now\s+WHERE\s+/i, "WHERE ");
+      const selectSql = wherePreview.startsWith("WHERE ")
+        ? `SELECT id FROM reports ${wherePreview}`
+        : `SELECT id FROM reports`;
+      const updated = db.prepare(selectSql).all(params);
+      lastSoftDeletedIds = updated.map(r => r.id);
+    } else {
+      const info = db.prepare(sql).run(params);
+      changed = info.changes || 0;
+      lastSoftDeletedIds = [];
+    }
+
+    res.json({ deleted: changed, wouldAffect });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Undo last soft delete
+app.post("/api/reports/undo", (req, res) => {
+  try {
+    if (!lastSoftDeletedIds.length) return res.json({ restored: 0 });
+    const idsJson = JSON.stringify(lastSoftDeletedIds);
+    const info = db.prepare(`
+      UPDATE reports SET deleted_at = NULL
+      WHERE id IN (SELECT value FROM json_each(@idsJson))
+    `).run({ idsJson });
+    const restored = info.changes || 0;
+    lastSoftDeletedIds = [];
+    res.json({ restored });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Export JSON for backup
+app.get("/api/export", (req, res) => {
+  const rows = db.prepare(`SELECT * FROM reports ORDER BY datetime(created_at) DESC`).all();
+  const parsed = rows.map(r => ({ ...r, tags: safeParseJson(r.tags, []) }));
+  res.setHeader("Content-Type", "application/json");
+  res.send(JSON.stringify(parsed, null, 2));
+});
+
+// ---------- UI ----------
+app.get("/", (_req, res) => {
+  res.type("html").send(renderHtml());
+});
+
+// ---------- Utilities ----------
+function safeParseJson(s, fallback) {
+  try { return JSON.parse(s); } catch { return fallback; }
+}
+
+function renderHtml() {
+  // Lightweight UI with selection + delete controls
+  return /* html */ `
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Employee Reports – Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0b1620;
+      --panel: #0f2133;
+      --panel2: #0d1b2a;
+      --text: #eaf2fb;
+      --muted: #93a4b7;
+      --accent: #4bb6f0;
+      --danger: #ff6b6b;
+      --warn: #f7b801;
+      --ok: #2ecc71;
+    }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+    header { display:flex; align-items:center; justify-content:space-between; padding: 16px 20px; background: linear-gradient(180deg, #0d2640, #0b1620); position: sticky; top:0; z-index:10; border-bottom: 1px solid #123; }
+    h1 { margin: 0; font-size: 18px; letter-spacing: .4px; }
+    .controls { display:flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    button, select, input { background: var(--panel); color: var(--text); border: 1px solid #234; padding: 8px 10px; border-radius: 8px; }
+    button:hover { filter: brightness(1.1); }
+    .btn-danger { background: #5c1d1d; border-color: #7a2a2a; }
+    .btn-warn { background: #4a3b10; border-color: #6b520f; }
+    .btn-ok { background: #0f3a2a; border-color: #17563e; }
+    .page { padding: 16px 20px; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+    .card { background: var(--panel2); border: 1px solid #123; border-radius: 10px; padding: 12px; display:flex; gap: 12px; align-items:flex-start; }
+    .meta { font-size: 12px; color: var(--muted); display:flex; gap:6px; flex-wrap:wrap; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background: #1b3a57; color: #d6ecff; font-size: 11px; margin-right: 6px; }
+    .deleted { opacity: .6; border-color: #402; background: #1c0f19; }
+    .row-top { display:flex; justify-content:space-between; align-items:center; gap: 10px; }
+    .wrap { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+    .left { display:flex; gap: 10px; align-items:center; }
+    .right { display:flex; gap: 8px; align-items:center; }
+    .filters { display:flex; gap:10px; flex-wrap:wrap; margin-top: 8px; }
+    .small { font-size: 12px; }
+    .muted { color: var(--muted); }
+    .section { margin: 12px 0 6px; font-weight: 600; color: #bfe3ff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Employee Reports – Admin</h1>
+    <div class="controls">
+      <button id="refreshBtn">Refresh</button>
+      <button id="selectAllBtn">Select all</button>
+      <button id="clearSelBtn">Clear</button>
+      <label class="small"><input type="checkbox" id="showDeleted"> Show deleted</label>
+      <a class="small" href="/api/export" target="_blank" style="text-decoration:none;color:#9dd6ff">Export JSON</a>
+    </div>
+  </header>
+
+  <div class="page">
+    <div class="section">Quick delete by selection</div>
+    <div class="controls">
+      <button id="delSoftBtn" class="btn-warn">Delete selected (soft)</button>
+      <button id="delHardBtn" class="btn-danger">Delete selected (hard)</button>
+      <button id="undoBtn" class="btn-ok">Undo last soft delete</button>
+    </div>
+
+    <div class="section">Delete by filter</div>
+    <div class="filters">
+      <label class="small"><input type="checkbox" id="fUnknown"> Email is "Unknown" / empty</label>
+      <select id="fTags" multiple size="5" title="Hold Ctrl/Cmd to select multiple">
+        ${["Other","Management","Low Pay","Career Growth","Overtime","Benefits","Safety","Culture","Burnout","No issue selected"].map(t => `<option value="${t}">${t}</option>`).join("")}
+      </select>
+      <span class="small">From: <input type="datetime-local" id="fAfter"></span>
+      <span class="small">To: <input type="datetime-local" id="fBefore"></span>
+      <button id="fSoftBtn" class="btn-warn">Delete by filter (soft)</button>
+      <button id="fHardBtn" class="btn-danger">Delete by filter (hard)</button>
+    </div>
+
+    <div class="section">Reports</div>
+    <div id="list" class="grid"></div>
+  </div>
+
+  <script>
+    const $ = (q) => document.querySelector(q);
+    const $$ = (q) => Array.from(document.querySelectorAll(q));
+    const state = { data: [], selected: new Set() };
+
+    function fmtDate(iso) {
+      if (!iso) return "—";
+      const d = new Date(iso);
+      return d.toLocaleString();
+    }
+
+    function tagsPretty(tags) {
+      if (!Array.isArray(tags) || tags.length === 0) return "";
+      return tags.map(t => '<span class="pill">' + t + '</span>').join(" ");
+    }
+
+    async function fetchReports() {
+      const showDeleted = $("#showDeleted").checked;
+      const res = await fetch("/api/reports?includeDeleted=" + showDeleted);
+      state.data = await res.json();
+      render();
+    }
+
+    function render() {
+      const list = $("#list");
+      list.innerHTML = "";
+      state.data.forEach(r => {
+        const card = document.createElement("div");
+        card.className = "card" + (r.deleted_at ? " deleted" : "");
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = state.selected.has(r.id);
+        cb.addEventListener("change", () => {
+          if (cb.checked) state.selected.add(r.id);
+          else state.selected.delete(r.id);
+        });
+
+        const content = document.createElement("div");
+        content.style.flex = "1";
+
+        const top = document.createElement("div");
+        top.className = "row-top";
+        const left = document.createElement("div");
+        left.className = "left";
+        left.innerHTML = \`
+          <div><strong>\${r.email || "Unknown"}</strong></div>
+          <div class="muted">Issue: \${r.issue || "N/A"}</div>
+        \`;
+
+        const right = document.createElement("div");
+        right.className = "right small";
+        right.innerHTML = \`<span class="muted">\${fmtDate(r.created_at)}</span>\`;
+
+        top.appendChild(left);
+        top.appendChild(right);
+
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.innerHTML = tagsPretty(r.tags);
+
+        content.appendChild(top);
+        content.appendChild(meta);
+
+        card.appendChild(cb);
+        card.appendChild(content);
+        list.appendChild(card);
+      });
+    }
+
+    function getSelectedIds() {
+      return Array.from(state.selected);
+    }
+
+    $("#refreshBtn").addEventListener("click", fetchReports);
+    $("#selectAllBtn").addEventListener("click", () => {
+      state.data.forEach(r => state.selected.add(r.id));
+      render();
+    });
+    $("#clearSelBtn").addEventListener("click", () => {
+      state.selected.clear();
+      render();
+    });
+    $("#showDeleted").addEventListener("change", fetchReports);
+
+    async function postJSON(url, body) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.error || (res.status + " " + res.statusText));
+      }
+      return res.json();
+    }
+
+    $("#delSoftBtn").addEventListener("click", async () => {
+      const ids = getSelectedIds();
+      if (!ids.length) return alert("No rows selected.");
+      const { deleted } = await postJSON("/api/reports/bulk-delete", { ids, softDelete: true });
+      alert("Soft-deleted " + deleted + " report(s).");
+      state.selected.clear();
+      fetchReports();
+    });
+
+    $("#delHardBtn").addEventListener("click", async () => {
+      const ids = getSelectedIds();
+      if (!ids.length) return alert("No rows selected.");
+      if (!confirm("Hard delete " + ids.length + " report(s)? This cannot be undone.")) return;
+      const { deleted } = await postJSON("/api/reports/bulk-delete", { ids, softDelete: false });
+      alert("Hard-deleted " + deleted + " report(s).");
+      state.selected.clear();
+      fetchReports();
+    });
+
+    $("#undoBtn").addEventListener("click", async () => {
+      const { restored } = await postJSON("/api/reports/undo", {});
+      alert("Restored " + restored + " report(s).");
+      fetchReports();
+    });
+
+    function getFilterPayload() {
+      const tagOptions = Array.from($("#fTags").options);
+      const tagIn = tagOptions.filter(o => o.selected).map(o => o.value);
+      const after = $("#fAfter").value ? new Date($("#fAfter").value).toISOString() : null;
+      const before = $("#fBefore").value ? new Date($("#fBefore").value).toISOString() : null;
+      return {
+        emailIsUnknown: $("#fUnknown").checked,
+        tagIn,
+        createdAfter: after,
+        createdBefore: before
+      };
+    }
+
+    $("#fSoftBtn").addEventListener("click", async () => {
+      const payload = getFilterPayload();
+      const res = await postJSON("/api/reports/delete-by-filter", { ...payload, softDelete: true });
+      alert(\`Soft-deleted \${res.deleted} (would affect: \${res.wouldAffect})\`);
+      fetchReports();
+    });
+
+    $("#fHardBtn").addEventListener("click", async () => {
+      const payload = getFilterPayload();
+      if (!confirm("Hard delete by filter? This cannot be undone.")) return;
+      const res = await postJSON("/api/reports/delete-by-filter", { ...payload, softDelete: false });
+      alert(\`Hard-deleted \${res.deleted} (would affect: \${res.wouldAffect})\`);
+      fetchReports();
+    });
+
+    // Initial load
+    fetchReports();
+  </script>
+</body>
+</html>
+`;
+}
+
+// ---------- Start server ----------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("Server running at http://localhost:" + PORT);
+});
