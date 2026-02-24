@@ -272,3 +272,59 @@
 </script>
 </body>
 </html>
+/* BIG, visible trash delete button */
+.del-x {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid #7a2a2a;
+  background: #c43d3d; /* bright */
+  color: #fff;
+  font-weight: 900;
+  font-size: 18px;
+  line-height: 30px;
+  text-align: center;
+  cursor: pointer;
+  z-index: 5; /* above everything inside the card */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  user-select: none;
+}
+.del-x:hover { filter: brightness(1.05); }
+.del-x:active { transform: translateY(1px); }
+.card {
+  position: relative;
+  padding: 12px 56px 12px 12px; /* note the right padding */
+  overflow: visible;
+}
+async function handleRowDelete(ev, id) {
+  const hard = ev.shiftKey; // Shift+Click => hard delete
+  if (hard && !confirm("Hard delete this report? This cannot be undone.")) return;
+
+  const url = "/api/reports/" + encodeURIComponent(id) + "?soft=" + (!hard);
+  const res = await fetch(url, { method: "DELETE" });
+  const data = await res.json().catch(() => ({}));
+
+  if (!res.ok) {
+    alert("Delete failed: " + (data.error || res.statusText));
+    return;
+  }
+  // Refresh the list after delete
+  if (typeof fetchReports === "function") fetchReports();
+}
+// Visible delete button (trash icon)
+const delBtn = document.createElement("button");
+delBtn.className = "del-x";
+delBtn.type = "button";
+delBtn.setAttribute("aria-label", "Delete report");
+delBtn.title = "Click: soft delete. Hold Shift: hard delete.";
+delBtn.textContent = "🗑️";        // trash icon
+delBtn.style.fontSize = "20px";    // make it readable
+delBtn.style.lineHeight = "20px";
+delBtn.addEventListener("click", (ev) => handleRowDelete(ev, r.id));
+card.appendChild(delBtn);
